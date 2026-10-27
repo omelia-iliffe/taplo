@@ -341,7 +341,7 @@ impl<E: Environment> Schemas<E> {
         if let Some(r) = schema.schema_ref() {
             let url = reference_url(root_url, r)
                 .ok_or_else(|| anyhow!("could not determine schema URL"))?;
-            let schema = self.resolve_schema(url).await?;
+            let schema = with_ref_annotations(schema, self.resolve_schema(url).await?);
             return self
                 .collect_schemas(root_url, &schema, value, full_path.clone(), path, schemas)
                 .await;
@@ -609,7 +609,7 @@ impl<E: Environment> Schemas<E> {
                     return None;
                 }
             };
-            let schema = match self.resolve_schema(url).await {
+            let target = match self.resolve_schema(url).await {
                 Ok(s) => s,
                 Err(error) => {
                     tracing::error!(?error, "failed to resolve schema");
@@ -617,11 +617,50 @@ impl<E: Environment> Schemas<E> {
                 }
             };
 
-            Some(schema)
+            Some(with_ref_annotations(schema, target))
         } else {
             None
         }
     }
+}
+
+/// Annotation keywords that are kept when they appear beside a `$ref`.
+///
+/// Drafts up to 7 ignore `$ref` siblings for validation, but annotations
+/// still apply, and 2020-12 schemas (e.g. from schemars 1) put a field's
+/// description and default there instead of wrapping the ref in `allOf`.
+const REF_SIBLING_ANNOTATIONS: &[&str] = &[
+    "title",
+    "description",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    ext::EXTENSION_KEY,
+];
+
+/// Overlays the annotations found beside a `$ref` onto the resolved target.
+fn with_ref_annotations(referrer: &Value, target: Arc<Value>) -> Arc<Value> {
+    let Some(target_obj) = target.as_object() else {
+        return target;
+    };
+
+    let mut annotations = REF_SIBLING_ANNOTATIONS
+        .iter()
+        .filter_map(|&k| referrer.get(k).map(|v| (k, v)))
+        .peekable();
+
+    if annotations.peek().is_none() {
+        return target;
+    }
+
+    let mut merged = target_obj.clone();
+    for (k, v) in annotations {
+        merged.insert(k.to_string(), v.clone());
+    }
+
+    Arc::new(Value::Object(merged))
 }
 
 fn reference_url(root_url: &Url, reference: &str) -> Option<Url> {
@@ -745,5 +784,99 @@ mod formats {
 
     pub(super) fn semver_req(value: &str) -> bool {
         semver::VersionReq::parse(value).is_ok()
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+    use crate::environment::native::NativeEnvironment;
+    use serde_json::json;
+
+    fn schema_with_ref_siblings() -> Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "level": {
+                    "$ref": "#/$defs/Level",
+                    "description": "Outer level.",
+                    "default": "info"
+                },
+                "chained": {
+                    "$ref": "#/$defs/Alias",
+                    "description": "Outer chained."
+                },
+                "plain": { "$ref": "#/$defs/Level" }
+            },
+            "$defs": {
+                "Level": {
+                    "description": "Inner level.",
+                    "type": "string",
+                    "enum": ["debug", "info"]
+                },
+                "Alias": {
+                    "$ref": "#/$defs/Level",
+                    "description": "Inner alias."
+                }
+            }
+        })
+    }
+
+    async fn setup() -> (Schemas<NativeEnvironment>, Url) {
+        let schemas = Schemas::new(NativeEnvironment::new(), reqwest::Client::new());
+        let url = Url::parse("taplo://test.schema.json").unwrap();
+        schemas
+            .add_schema(&url, Arc::new(schema_with_ref_siblings()))
+            .await;
+        (schemas, url)
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn completion_keeps_ref_sibling_annotations() {
+        block_on(async {
+            let (schemas, url) = setup().await;
+            let children = schemas
+                .possible_schemas_from(&url, &json!({}), &Keys::empty(), 2)
+                .await
+                .unwrap();
+
+            let child = |name: &str| {
+                let path = Keys::empty().join(Key::from(name));
+                children
+                    .iter()
+                    .find(|(_, p, _)| *p == path)
+                    .map_or_else(|| panic!("no schema for {name}"), |(_, _, s)| s.clone())
+            };
+
+            let level = child("level");
+            assert_eq!(level["description"], "Outer level.");
+            assert_eq!(level["default"], "info");
+            assert_eq!(level["enum"], json!(["debug", "info"]));
+
+            assert_eq!(child("chained")["description"], "Outer chained.");
+            assert_eq!(child("plain")["description"], "Inner level.");
+        });
+    }
+
+    #[test]
+    fn hover_keeps_ref_sibling_annotations() {
+        block_on(async {
+            let (schemas, url) = setup().await;
+            let value = json!({ "level": "debug" });
+            let path = Keys::empty().join(Key::from("level"));
+            let found = schemas.schemas_at_path(&url, &value, &path).await.unwrap();
+
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].1["description"], "Outer level.");
+            assert_eq!(found[0].1["default"], "info");
+        });
     }
 }
